@@ -1,0 +1,198 @@
+name: Secure RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+
+      # 1. Configure secure RDP
+      - name: Configure Secure RDP
+        shell: powershell
+        run: |
+          # Enable Remote Desktop
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0 `
+            -Force
+
+          # Keep Network Level Authentication enabled
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' `
+            -Value 1 `
+            -Force
+
+          # Use Negotiate instead of disabling RDP security
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'SecurityLayer' `
+            -Value 1 `
+            -Force
+
+          # Require strong RDP encryption
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'MinEncryptionLevel' `
+            -Value 3 `
+            -Force
+
+          # Remove our previous firewall rule if it exists
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+
+          # Allow RDP ONLY from the Tailscale IPv4 range
+          netsh advfirewall firewall add rule `
+            name="RDP-Tailscale" `
+            dir=in `
+            action=allow `
+            protocol=TCP `
+            localport=3389 `
+            remoteip=100.64.0.0/10
+
+          Restart-Service TermService -Force
+
+          Write-Host "Secure RDP configuration completed."
+
+      # 2. Create a normal RDP user
+      - name: Create RDP User
+        shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+              Write-Error "RDP_PASSWORD secret is missing."
+              exit 1
+          }
+
+          $securePass = ConvertTo-SecureString `
+            $env:RDP_PASSWORD `
+            -AsPlainText `
+            -Force
+
+          # Remove existing account if present
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name "RDP"
+          }
+
+          # Create standard user
+          New-LocalUser `
+            -Name "RDP" `
+            -Password $securePass `
+            -AccountNeverExpires `
+            -PasswordNeverExpires:$false
+
+          # Only give Remote Desktop permission
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member "RDP"
+
+          # Mask password if it accidentally appears in logs
+          Write-Output "::add-mask::$env:RDP_PASSWORD"
+
+          Write-Host "RDP user created successfully."
+
+      # 3. Install Tailscale
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest `
+            -Uri $tsUrl `
+            -OutFile $installer
+
+          Start-Process `
+            msiexec.exe `
+            -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" `
+            -Wait
+
+          Remove-Item $installer -Force
+
+      # 4. Connect to Tailscale
+      - name: Connect Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+              Write-Error "TAILSCALE_AUTH_KEY secret is missing."
+              exit 1
+          }
+
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey="$env:TAILSCALE_AUTH_KEY" `
+            --hostname="gh-rdp-$env:GITHUB_RUN_ID" `
+            --accept-dns=false
+
+          $tsIP = $null
+
+          for ($i = 0; $i -lt 12; $i++) {
+              $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4).Trim()
+
+              if ($tsIP) {
+                  break
+              }
+
+              Start-Sleep -Seconds 5
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Unable to obtain Tailscale IPv4 address."
+              exit 1
+          }
+
+          # Mask the IP from logs
+          Write-Output "::add-mask::$tsIP"
+
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+          Write-Host "Tailscale connected successfully."
+
+      # 5. Test RDP
+      - name: Verify RDP
+        shell: powershell
+        run: |
+          Write-Host "Testing RDP connection..."
+
+          $result = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389
+
+          if (-not $result.TcpTestSucceeded) {
+              Write-Error "RDP port 3389 is not reachable."
+              exit 1
+          }
+
+          Write-Host "RDP connection test successful."
+
+      # 6. Show connection information
+      - name: RDP Information
+        shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          Write-Host ""
+          Write-Host "=============================="
+          Write-Host "       SECURE RDP READY"
+          Write-Host "=============================="
+          Write-Host "Address : $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: Stored in GitHub Secret RDP_PASSWORD"
+          Write-Host "=============================="
+          Write-Host ""
+          Write-Host "Use the Tailscale IP above in Windows App."
+
+      # 7. Keep the runner alive
+      - name: Maintain Connection
+        shell: powershell
+        run: |
+          while ($true) {
+              Write-Host "[$(Get-Date)] Secure RDP is active."
+              Start-Sleep -Seconds 300
+          }
